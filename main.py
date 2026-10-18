@@ -1,55 +1,65 @@
 
+import asyncio
+import base64
+import json
+import math
+import os
 import time
 import uuid
-import base64
 from collections import defaultdict, deque
-from threading import Lock
-from typing import Optional
+from typing import Any
 
-from fastapi import FastAPI, Header, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from starlette.datastructures import MutableHeaders
 
+app = FastAPI(title="Orders API", version="1.0.0")
+
+# Allow browser-based graders to call the API.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Retry-After"],
+)
 
 TOTAL_ORDERS = 59
 RATE_LIMIT = 17
 WINDOW_SECONDS = 10
 
-api = FastAPI()
-
-lock = Lock()
-idempotency_store = {}
-client_requests = defaultdict(deque)
-
-catalog = [
-    {"id": i, "item": f"Order {i}", "status": "created"}
+# Fixed catalog for pagination: IDs 1 through 59.
+CATALOG = [
+    {"id": i, "item": f"Item {i}", "status": "available"}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
+# In-memory storage. Suitable for a single Render instance.
+idempotency_store: dict[str, dict[str, Any]] = {}
+rate_limit_store = defaultdict(deque)
+rate_limit_lock = asyncio.Lock()
 
-class OrderRequest(__import__("pydantic").BaseModel):
-    item: Optional[str] = "New order"
 
-
-@api.middleware("http")
-async def rate_limit_middleware(request, call_next):
+@app.middleware("http")
+async def enforce_rate_limit(request: Request, call_next):
+    # Do not count browser CORS preflight requests.
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    client_id = request.headers.get("X-Client-Id", "anonymous")
+    client_id = request.headers.get("X-Client-Id", "default")
     now = time.monotonic()
 
-    with lock:
-        timestamps = client_requests[client_id]
+    async with rate_limit_lock:
+        timestamps = rate_limit_store[client_id]
 
+        # Remove requests outside the rolling 10-second window.
         while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
             timestamps.popleft()
 
         if len(timestamps) >= RATE_LIMIT:
             retry_after = max(
-                1,
-                int(WINDOW_SECONDS - (now - timestamps[0]) + 0.999),
+                1, math.ceil(WINDOW_SECONDS - (now - timestamps[0]))
             )
             return JSONResponse(
                 status_code=429,
@@ -62,92 +72,102 @@ async def rate_limit_middleware(request, call_next):
     return await call_next(request)
 
 
-@api.post("/orders")
-def create_order(
-    body: OrderRequest,
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
-):
-    with lock:
-        if idempotency_key in idempotency_store:
-            return JSONResponse(
-                status_code=200,
-                content=idempotency_store[idempotency_key],
-            )
-
-        order = {
-            "id": str(uuid.uuid4()),
-            "item": body.item,
-            "status": "created",
-        }
-        idempotency_store[idempotency_key] = order
-
-        return JSONResponse(status_code=201, content=order)
+@app.get("/")
+async def root():
+    return {
+        "message": "Orders API is running",
+        "total_orders": TOTAL_ORDERS,
+        "rate_limit": RATE_LIMIT,
+        "window_seconds": WINDOW_SECONDS,
+    }
 
 
-@api.get("/orders")
-def list_orders(
-    limit: int = Query(default=10, ge=1, le=59),
-    cursor: Optional[str] = Query(default=None),
-):
-    if not cursor:
-        start_id = 1
-    else:
-        try:
-            padded = cursor + "=" * (-len(cursor) % 4)
-            decoded = base64.urlsafe_b64decode(padded).decode("ascii")
-            start_id = int(decoded) + 1
-        except Exception:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Invalid cursor"},
-            )
-
-    if not 1 <= start_id <= TOTAL_ORDERS + 1:
-        return JSONResponse(
-            status_code=400,
-            content={"detail": "Invalid cursor"},
-        )
-
-    items = catalog[start_id - 1 : start_id - 1 + limit]
-
-    if items and items[-1]["id"] < TOTAL_ORDERS:
-        next_cursor = base64.urlsafe_b64encode(
-            str(items[-1]["id"]).encode("ascii")
-        ).decode("ascii").rstrip("=")
-    else:
-        next_cursor = None
-
-    return {"items": items, "next_cursor": next_cursor}
-
-
-@api.get("/healthz")
-def healthz():
+@app.get("/health")
+async def health():
     return {"status": "ok"}
 
 
-class EnsureRetryAfter:
-    """Ensure every HTTP 429 response has a Retry-After header."""
+@app.post("/orders", status_code=201)
+async def create_order(
+    request: Request,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+):
+    key = idempotency_key.strip()
+    if not key:
+        raise HTTPException(
+            status_code=400, detail="Idempotency-Key cannot be empty"
+        )
 
-    def __init__(self, app):
-        self.app = app
+    # Return the original order for a repeated key.
+    if key in idempotency_store:
+        return JSONResponse(
+            status_code=200,
+            content=idempotency_store[key],
+        )
 
-    async def __call__(self, scope, receive, send):
-        async def send_with_retry_after(message):
-            if message["type"] == "http.response.start":
-                if message["status"] == 429:
-                    headers = MutableHeaders(scope=message)
-                    if "Retry-After" not in headers:
-                        headers["Retry-After"] = str(WINDOW_SECONDS)
-            await send(message)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        body = {}
 
-        await self.app(scope, receive, send_with_retry_after)
+    if not isinstance(body, dict):
+        body = {"data": body}
+
+    order = {
+        "id": str(uuid.uuid4()),
+        **body,
+    }
+
+    # Store the result so this key cannot create a duplicate order.
+    idempotency_store[key] = order
+
+    return JSONResponse(status_code=201, content=order)
 
 
-cors_app = CORSMiddleware(
-    app=api,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+def encode_cursor(offset: int) -> str:
+    raw = str(offset).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
-app = EnsureRetryAfter(cors_app)
+
+def decode_cursor(cursor: str) -> int:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        offset = int(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        if offset < 0 or offset > TOTAL_ORDERS:
+            raise ValueError
+        return offset
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+
+
+@app.get("/orders")
+async def list_orders(
+    limit: int = Query(default=10, ge=1),
+    cursor: str | None = Query(default=None),
+):
+    offset = decode_cursor(cursor) if cursor else 0
+
+    # Never return more items than the requested limit.
+    items = CATALOG[offset : offset + limit]
+    next_offset = offset + len(items)
+
+    next_cursor = (
+        encode_cursor(next_offset)
+        if next_offset < TOTAL_ORDERS
+        else None
+    )
+
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8000")),
+    )
