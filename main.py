@@ -14,35 +14,27 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Orders API", version="1.0.0")
 
-# CORS middleware must be registered before deployment.
-# Starlette handles OPTIONS preflight requests automatically.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Retry-After"],
-)
-
 TOTAL_ORDERS = 59
 RATE_LIMIT = 17
 WINDOW_SECONDS = 10
 
+# Fixed catalog with IDs 1 through 59.
 CATALOG = [
     {"id": i, "item": f"Item {i}", "status": "available"}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
+# In-memory stores (use one Render instance during grading).
 idempotency_store: dict[str, dict[str, Any]] = {}
 idempotency_lock = asyncio.Lock()
+
 rate_limit_store = defaultdict(deque)
 rate_limit_lock = asyncio.Lock()
 
 
 @app.middleware("http")
 async def enforce_rate_limit(request: Request, call_next):
-    # Preflight requests must not consume the client's quota.
+    # Browser preflight requests must not consume quota.
     if request.method == "OPTIONS":
         return await call_next(request)
 
@@ -55,6 +47,7 @@ async def enforce_rate_limit(request: Request, call_next):
     async with rate_limit_lock:
         timestamps = rate_limit_store[client_id]
 
+        # Rolling 10-second window.
         while timestamps and now - timestamps[0] >= WINDOW_SECONDS:
             timestamps.popleft()
 
@@ -94,9 +87,7 @@ async def list_orders(
     limit: int = Query(default=10, ge=1),
     cursor: str | None = Query(default=None),
 ):
-    if cursor is None or cursor == "":
-        offset = 0
-    else:
+    if cursor:
         try:
             padded = cursor + "=" * (-len(cursor) % 4)
             offset = int(
@@ -106,19 +97,26 @@ async def list_orders(
                 raise ValueError
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid cursor")
+    else:
+        offset = 0
 
     items = CATALOG[offset:offset + limit]
     next_offset = offset + len(items)
 
-    next_cursor = (
-        base64.urlsafe_b64encode(str(next_offset).encode())
-        .decode()
-        .rstrip("=")
-        if next_offset < TOTAL_ORDERS
-        else None
-    )
+    next_cursor = None
+    if next_offset < TOTAL_ORDERS:
+        next_cursor = (
+            base64.urlsafe_b64encode(
+                str(next_offset).encode("utf-8")
+            )
+            .decode("ascii")
+            .rstrip("=")
+        )
 
-    return {"items": items, "next_cursor": next_cursor}
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+    }
 
 
 @app.post("/orders", status_code=201)
@@ -134,6 +132,7 @@ async def create_order(
         )
 
     async with idempotency_lock:
+        # Same key returns the same order without creating a duplicate.
         if key in idempotency_store:
             return JSONResponse(
                 status_code=200,
@@ -148,10 +147,26 @@ async def create_order(
         if not isinstance(body, dict):
             body = {"data": body}
 
-        order = {"id": str(uuid.uuid4()), **body}
+        order = {
+            "id": str(uuid.uuid4()),
+            **body,
+        }
+
         idempotency_store[key] = order
 
         return JSONResponse(status_code=201, content=order)
+
+
+# Wrap the entire application in CORS so even 429 responses
+# include the required CORS headers.
+app = CORSMiddleware(
+    app=app,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Retry-After"],
+)
 
 
 if __name__ == "__main__":
