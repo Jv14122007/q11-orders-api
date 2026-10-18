@@ -11,49 +11,32 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI()
+api = FastAPI()
 
 TOTAL_ORDERS = 59
 RATE_LIMIT = 17
 WINDOW_SECONDS = 10
 
-# CORS middleware wraps the application, so its headers are applied
-# to normal responses and rate-limit responses.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
 lock = Lock()
+idempotency_store = {}
+client_requests = defaultdict(deque)
 
-# Fixed catalog containing IDs 1 through 59.
 catalog = [
     {"id": i, "item": f"Order {i}", "status": "created"}
     for i in range(1, TOTAL_ORDERS + 1)
 ]
-
-# In-memory stores.
-idempotency_store = {}
-client_requests = defaultdict(deque)
 
 
 class OrderRequest(BaseModel):
     item: Optional[str] = "New order"
 
 
-@app.middleware("http")
+@api.middleware("http")
 async def rate_limit_middleware(request, call_next):
-    # Do not count CORS preflight requests against the limit.
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # Only rate-limit requests that supply a client ID.
-    client_id = request.headers.get("X-Client-Id")
-    if not client_id:
-        return await call_next(request)
-
+    client_id = request.headers.get("X-Client-Id", "anonymous")
     now = time.monotonic()
 
     with lock:
@@ -78,7 +61,7 @@ async def rate_limit_middleware(request, call_next):
     return await call_next(request)
 
 
-@app.post("/orders", status_code=201)
+@api.post("/orders")
 def create_order(
     body: OrderRequest,
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
@@ -96,23 +79,26 @@ def create_order(
             "status": "created",
         }
         idempotency_store[idempotency_key] = order
-
         return JSONResponse(status_code=201, content=order)
 
 
-@app.get("/orders")
+@api.get("/orders")
 def list_orders(
     limit: int = Query(default=10, ge=1, le=59),
-    cursor: Optional[str] = Query(default=None),
+    cursor: Optional[str] = None,
 ):
-    # Cursors encode the last returned order ID.
-    if cursor is None or cursor == "":
+    if not 1 <= limit <= TOTAL_ORDERS:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Invalid limit"},
+        )
+
+    if not cursor:
         start_id = 1
     else:
         try:
-            decoded = base64.urlsafe_b64decode(
-                cursor.encode("ascii") + b"=" * (-len(cursor) % 4)
-            ).decode("ascii")
+            padded = cursor + "=" * (-len(cursor) % 4)
+            decoded = base64.urlsafe_b64decode(padded).decode("ascii")
             start_id = int(decoded) + 1
         except Exception:
             return JSONResponse(
@@ -126,7 +112,7 @@ def list_orders(
             content={"detail": "Invalid cursor"},
         )
 
-    items = catalog[start_id - 1 : start_id - 1 + limit]
+    items = catalog[start_id - 1:start_id - 1 + limit]
 
     if items and items[-1]["id"] < TOTAL_ORDERS:
         next_cursor = base64.urlsafe_b64encode(
@@ -135,12 +121,18 @@ def list_orders(
     else:
         next_cursor = None
 
-    return {
-        "items": items,
-        "next_cursor": next_cursor,
-    }
+    return {"items": items, "next_cursor": next_cursor}
 
 
-@app.get("/healthz")
+@api.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
+
+# CORS wraps the complete app, including middleware-generated 429 responses.
+app = CORSMiddleware(
+    app=api,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
